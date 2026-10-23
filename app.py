@@ -8,7 +8,9 @@ to Google Gemini and shows a plain-English analysis.
 # --- Imports ---
 # os: read environment variables (like the API key)
 # pathlib.Path: build a file path that works on any computer
+# time: pause between retries when Gemini is busy
 import os
+import time
 from pathlib import Path
 
 import streamlit as st
@@ -53,25 +55,86 @@ except FileNotFoundError:
     st.error("Could not find prompt.txt. Make sure it is in the same folder as app.py.")
 
 
-# --- Helper: send the policy to Gemini ---
-def analyze_policy(policy_text: str) -> str:
-    """Call Gemini with the system prompt and the user's privacy policy text."""
+# Main model, then a lighter Flash-Lite backup if the main one stays busy.
+PRIMARY_MODEL = "gemini-flash-latest"
+BACKUP_MODEL = "gemini-flash-lite-latest"
+# Wait 2s, then 4s, then 8s before each of the 3 retries.
+RETRY_WAITS_SECONDS = [2, 4, 8]
+
+
+def is_unavailable_error(err: Exception) -> bool:
+    """Return True if Gemini reported HTTP 503 / UNAVAILABLE (high demand)."""
+    code = getattr(err, "code", None)
+    status = str(getattr(err, "status", "") or "").upper()
+    text = str(err).upper()
+    if code == 503 or status == "UNAVAILABLE":
+        return True
+    return "503" in text and ("UNAVAILABLE" in text or "HIGH DEMAND" in text)
+
+
+# --- Helper: stream the Gemini answer in pieces ---
+def analyze_policy_stream(policy_text: str, model_name: str):
+    """Yield chunks of Gemini's answer as they arrive.
+
+    A generator (this function uses `yield`) hands back one piece at a time
+    instead of waiting for the full response. Streamlit can show each piece
+    on screen immediately.
+    """
     # Create a client that authenticates with our API key.
     client = genai.Client(api_key=api_key)
 
-    # generate_content sends the request.
-    # system_instruction tells the model HOW to answer (from prompt.txt).
-    # contents is the privacy policy the user pasted.
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
+    # generate_content_stream is like generate_content, but it returns
+    # an iterator of chunks instead of one finished answer.
+    stream = client.models.generate_content_stream(
+        model=model_name,
         contents=policy_text,
         config=types.GenerateContentConfig(
             system_instruction=system_instruction,
         ),
     )
 
-    # response.text is the model's answer as a string.
-    return response.text
+    # Each chunk may or may not contain text. Skip empty ones.
+    for chunk in stream:
+        piece = chunk.text
+        if piece:
+            yield piece
+
+
+def stream_analysis(policy_text: str) -> None:
+    """Stream the analysis, retrying on 503, then trying Flash-Lite once.
+
+    Raises the last error if every attempt fails, so the caller can show
+    the right on-screen message.
+    """
+    last_error = None
+
+    # 1 first try + 3 retries (waits of 2, 4, then 8 seconds).
+    for attempt in range(1 + len(RETRY_WAITS_SECONDS)):
+        try:
+            st.write_stream(analyze_policy_stream(policy_text, PRIMARY_MODEL))
+            return
+        except Exception as err:
+            print(type(err).__name__, err)
+            if not is_unavailable_error(err):
+                raise
+            last_error = err
+            # After the last retry, stop waiting and try the backup model.
+            if attempt >= len(RETRY_WAITS_SECONDS):
+                break
+            wait_seconds = RETRY_WAITS_SECONDS[attempt]
+            with st.spinner(
+                f"The AI service is busy. Retrying in {wait_seconds} seconds..."
+            ):
+                time.sleep(wait_seconds)
+
+    # One extra try with the lighter free-tier Flash-Lite model.
+    try:
+        st.write_stream(analyze_policy_stream(policy_text, BACKUP_MODEL))
+    except Exception as err:
+        print(type(err).__name__, err)
+        if last_error is not None and is_unavailable_error(err):
+            raise last_error from err
+        raise
 
 
 # --- Sidebar disclaimer ---
@@ -128,16 +191,20 @@ if st.button("Analyze", type="primary"):
             "That text is over 100,000 characters. Please paste a shorter excerpt."
         )
     else:
-        # st.spinner shows a waiting message until the code inside finishes.
+        # Stream the answer so headings and bullets appear as they are generated.
         try:
-            with st.spinner("Analyzing the privacy policy..."):
-                analysis = analyze_policy(cleaned_text)
-            # Render Gemini's structured answer as Markdown (headings, bullets, etc.).
-            st.markdown(analysis)
-        except Exception:
+            stream_analysis(cleaned_text)
+        except Exception as err:
             # Catch API / network problems so the app does not crash.
-            st.error(
-                "Something went wrong while contacting the analysis service. "
-                "Please try again in a moment. If it keeps failing, check your "
-                "API key and internet connection."
-            )
+            # Print the real error in the terminal only (never the API key).
+            print(type(err).__name__, err)
+            if is_unavailable_error(err):
+                st.error(
+                    "The AI service is busy right now. Please try again in a minute."
+                )
+            else:
+                st.error(
+                    "Something went wrong while contacting the analysis service. "
+                    "Please try again in a moment. If it keeps failing, check your "
+                    "API key and internet connection."
+                )
