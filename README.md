@@ -38,6 +38,21 @@ Running TikTok's privacy policy through the analyzer surfaced several things mos
 I spot-checked each of these findings against the original policy text to confirm the AI didn't invent them.
 
 ## A bug I found and fixed: AI hallucination
+## Making it faster and more reliable
+
+After launch, I found two problems: the app felt slow, and it sometimes failed when Google's AI service was busy.
+
+**Speed.** Privacy policies are long, and the app used to show nothing until the AI had finished writing all six sections. Now the analysis **streams** onto the screen as it's generated, so results start appearing within seconds.
+
+**Reliability.** Google's servers occasionally return a "high demand" error. Instead of failing, the app now:
+
+1. **Retries automatically** up to 3 times, waiting a little longer each time
+2. **Falls back to a lighter backup model** if the main one is still overloaded
+3. **Shows a clear message** if the service is busy, instead of a generic error
+
+**Debugging without exposing secrets.** The app originally hid every error behind a friendly message, which made problems impossible to diagnose. It now logs the error type to the server console for debugging, without ever logging the API key.
+
+**A lesson from this:** a few days after launch, the app stopped working because Google changed how its API keys work. The fix was generating a new key tied to a restricted service account. Apps that depend on outside services can break when those services change, so logging and clear error handling matter.
 
 During testing, I typed only the words "TikTok privacy policy" instead of pasting the actual policy. The app still produced a detailed analysis, written entirely from the AI model's general knowledge rather than from any document.
 
@@ -53,6 +68,7 @@ Now the app asks for the full policy text instead of guessing.
 - **The API key is never in the code.** Locally it's stored in a `.env` file excluded by `.gitignore`. In production it's stored in Streamlit's encrypted secrets.
 - **Users are warned not to paste confidential information**, because text is sent to a third-party AI provider for processing.
 - **Credential hygiene:** during development I accidentally exposed a GitHub access token in my terminal, so I revoked it and generated a new one.
+- **Least privilege:** the API key is bound to a dedicated service account with no extra permissions, restricted to the Gemini API only.
 
 ## How it works
 
